@@ -197,6 +197,7 @@ const englishErrorReplacements: Array<[RegExp, string]> = [
   [/^La tabla o el índice ya no existe\.$/, 'The table or index no longer exists.'],
   [/^DynamoDB limitó temporalmente la operación\. Espera un momento y vuelve a intentar\.$/, 'DynamoDB temporarily throttled the operation. Wait a moment and try again.'],
   [/^No fue posible completar la operación con DynamoDB\.$/, 'The DynamoDB operation could not be completed.'],
+  [/^No fue posible conectar con el endpoint de DynamoDB\.$/, 'Could not connect to the DynamoDB endpoint.'],
   [/^Query requiere un valor para la partition key\.$/, 'Query requires a partition key value.'],
   [/^El índice seleccionado no tiene sort key\.$/, 'The selected index does not have a sort key.'],
   [/^BETWEEN requiere dos valores\.$/, 'BETWEEN requires two values.'],

@@ -36,8 +36,11 @@ function assertTrustedSender(event: IpcMainInvokeEvent): void {
 }
 
 function toSafeErrorMessage(error: unknown): string {
-  const candidate = error as { name?: string; message?: string }
+  const candidate = error as { name?: string; message?: string; code?: string }
   const name = candidate?.name ?? ''
+  if (candidate?.code === 'ECONNREFUSED' || candidate?.code === 'ENOTFOUND') {
+    return 'No fue posible conectar con el endpoint de DynamoDB.'
+  }
   if (name === 'ExpiredTokenException' || /token.*expired|session.*expired/i.test(candidate?.message ?? '')) {
     return 'La sesión AWS expiró. Renueva el acceso SSO y vuelve a intentar.'
   }
