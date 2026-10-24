@@ -3,6 +3,7 @@ import type {
   ConnectionContext,
   DeleteRequest,
   DynamoExplorerApi,
+  ExportCsvRequest,
   ExploreRequest,
 } from '../shared/types'
 
@@ -13,6 +14,7 @@ const api: DynamoExplorerApi = {
     ipcRenderer.invoke('dynamodb:describe-table', request),
   explore: (request: ExploreRequest) => ipcRenderer.invoke('dynamodb:explore', request),
   deleteItem: (request: DeleteRequest) => ipcRenderer.invoke('dynamodb:delete-item', request),
+  exportCsv: (request: ExportCsvRequest) => ipcRenderer.invoke('dynamodb:export-csv', request),
 }
 
 contextBridge.exposeInMainWorld('dynamoExplorer', api)

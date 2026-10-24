@@ -18,6 +18,7 @@ import { sortDynamoItems } from './sorting'
 import type { SortDirection } from './sorting'
 import { createTranslator, getInitialLocale, localizeError } from './i18n'
 import type { Locale, Translate } from './i18n'
+import { dynamoItemsToCsv } from './csv'
 
 const REGIONS = [
   'us-east-1',
@@ -47,6 +48,11 @@ interface UiFilter extends FilterCondition {
 interface DeleteCandidate {
   item: DynamoItem
   key: DynamoItem
+}
+
+interface Notice {
+  key: 'deleteSuccess' | 'deleteMissing' | 'bulkDeleteSuccess' | 'csvExportSuccess'
+  values?: Record<string, string | number>
 }
 
 interface AttributeOption {
@@ -82,9 +88,11 @@ export default function App(): React.JSX.Element {
   const [loadingTables, setLoadingTables] = useState(false)
   const [loadingData, setLoadingData] = useState(false)
   const [error, setError] = useState('')
-  const [deleteCandidate, setDeleteCandidate] = useState<DeleteCandidate>()
+  const [deleteCandidates, setDeleteCandidates] = useState<DeleteCandidate[]>()
+  const [selectedRowIds, setSelectedRowIds] = useState<Set<string>>(() => new Set())
   const [deleting, setDeleting] = useState(false)
-  const [notice, setNotice] = useState<'deleteSuccess' | 'deleteMissing' | ''>('')
+  const [exporting, setExporting] = useState(false)
+  const [notice, setNotice] = useState<Notice>()
   const [attributeOptions, setAttributeOptions] = useState<AttributeOption[]>([])
   const [sidebarWidth, setSidebarWidth] = useState(() => {
     const savedWidth = Number(localStorage.getItem('dynamo-explorer:sidebar-width'))
@@ -151,6 +159,8 @@ export default function App(): React.JSX.Element {
     setResult(undefined)
     setAttributeOptions([])
     setSortColumn('')
+    setSelectedRowIds(new Set())
+    setDeleteCandidates(undefined)
     void refreshTables(profile, region)
   }, [profile, region])
 
@@ -183,6 +193,8 @@ export default function App(): React.JSX.Element {
     setSortOperator('')
     setCurrentCursor(undefined)
     setCursorHistory([])
+    setSelectedRowIds(new Set())
+    setDeleteCandidates(undefined)
     setLoadingData(true)
     setError('')
     try {
@@ -234,7 +246,8 @@ export default function App(): React.JSX.Element {
   async function runExplore(cursor?: DynamoItem, resetHistory = false): Promise<void> {
     setLoadingData(true)
     setError('')
-    setNotice('')
+    setNotice(undefined)
+    setSelectedRowIds(new Set())
     try {
       const response = await window.dynamoExplorer.explore(createExploreRequest(cursor))
       setResult(response)
@@ -320,36 +333,95 @@ export default function App(): React.JSX.Element {
   }
 
   function requestDelete(item: DynamoItem): void {
-    if (!schema) return
-    const tableIndex = schema.indexes.find((index) => index.kind === 'TABLE')
-    if (!tableIndex) return
-    const names = [tableIndex.partitionKey.name, tableIndex.sortKey?.name].filter(Boolean) as string[]
-    const key = Object.fromEntries(names.map((name) => [name, item[name]]).filter((entry) => Boolean(entry[1])))
-    setDeleteCandidate({ item, key })
+    const candidate = deleteCandidateForItem(item, schema)
+    if (candidate) setDeleteCandidates([candidate])
+  }
+
+  function requestBulkDelete(): void {
+    const candidates = result?.items
+      .filter((item, index) => selectedRowIds.has(rowIdentity(item, schema, index)))
+      .map((item) => deleteCandidateForItem(item, schema))
+      .filter(Boolean) as DeleteCandidate[] | undefined
+    if (candidates?.length) setDeleteCandidates(candidates)
+  }
+
+  function toggleRowSelection(rowId: string): void {
+    setSelectedRowIds((current) => {
+      const next = new Set(current)
+      if (next.has(rowId)) next.delete(rowId)
+      else next.add(rowId)
+      return next
+    })
+  }
+
+  function toggleAllRows(): void {
+    const visibleRowIds = sortedItems.map((item, index) => rowIdentity(item, schema, index))
+    const allSelected = visibleRowIds.length > 0 && visibleRowIds.every((rowId) => selectedRowIds.has(rowId))
+    setSelectedRowIds(allSelected ? new Set() : new Set(visibleRowIds))
   }
 
   async function confirmDelete(): Promise<void> {
-    if (!deleteCandidate) return
+    if (!deleteCandidates?.length) return
     setDeleting(true)
     setError('')
+    setNotice(undefined)
+    const candidates = deleteCandidates
+    const outcomes = await deleteWithConcurrency(candidates, 5, (candidate) =>
+      window.dynamoExplorer.deleteItem({ profile, region, tableName: selectedTable, key: candidate.key }),
+    )
+    const succeeded = candidates.filter((_, index) => outcomes[index].status === 'fulfilled')
+    const failed = candidates.filter((_, index) => outcomes[index].status === 'rejected')
+    const removedItems = new Set(succeeded.map((candidate) => candidate.item))
+    const removedIds = new Set(succeeded.map((candidate, index) => rowIdentity(candidate.item, schema, index)))
+
+    setResult((current) => current ? {
+      ...current,
+      items: current.items.filter((item) => !removedItems.has(item)),
+      count: Math.max(0, current.count - succeeded.length),
+    } : current)
+    setSelectedRowIds((current) => new Set([...current].filter((rowId) => !removedIds.has(rowId))))
+
+    if (failed.length > 0) {
+      const firstFailure = outcomes.find((outcome) => outcome.status === 'rejected')
+      setError(candidates.length === 1 && firstFailure?.status === 'rejected'
+        ? errorMessage(firstFailure.reason)
+        : t('bulkDeletePartialError', { failed: failed.length, total: candidates.length }))
+    }
+    if (succeeded.length > 0) {
+      const onlyOutcome = outcomes.length === 1 && outcomes[0].status === 'fulfilled' ? outcomes[0].value : undefined
+      setNotice(candidates.length === 1
+        ? { key: onlyOutcome?.deleted ? 'deleteSuccess' : 'deleteMissing' }
+        : { key: 'bulkDeleteSuccess', values: { count: succeeded.length } })
+    }
+    setDeleteCandidates(undefined)
+    setDeleting(false)
+  }
+
+  async function exportResults(): Promise<void> {
+    if (!selectedTable || sortedItems.length === 0) return
+    if (typeof window.dynamoExplorer.exportCsv !== 'function') {
+      setError(t('restartRequiredForExport'))
+      return
+    }
+    setExporting(true)
+    setError('')
+    setNotice(undefined)
     try {
-      const response = await window.dynamoExplorer.deleteItem({
-        profile,
-        region,
+      const response = await window.dynamoExplorer.exportCsv({
         tableName: selectedTable,
-        key: deleteCandidate.key,
+        contents: dynamoItemsToCsv(sortedItems, columns),
       })
-      setResult((current) =>
-        current ? { ...current, items: current.items.filter((item) => item !== deleteCandidate.item) } : current,
-      )
-      setNotice(response.deleted ? 'deleteSuccess' : 'deleteMissing')
-      setDeleteCandidate(undefined)
+      if (response.saved) setNotice({ key: 'csvExportSuccess' })
     } catch (caught) {
       setError(errorMessage(caught))
     } finally {
-      setDeleting(false)
+      setExporting(false)
     }
   }
+
+  const visibleRowIds = sortedItems.map((item, index) => rowIdentity(item, schema, index))
+  const allRowsSelected = visibleRowIds.length > 0 && visibleRowIds.every((rowId) => selectedRowIds.has(rowId))
+  const someRowsSelected = visibleRowIds.some((rowId) => selectedRowIds.has(rowId))
 
   const isProduction = /(^|[-_.])(prod|production|live)([-_.]|$)/i.test(`${profile} ${selectedTable}`)
 
@@ -467,6 +539,9 @@ export default function App(): React.JSX.Element {
                 </div>
                 <div className="header-actions">
                   {isProduction && <span className="production-badge">{t('production')}</span>}
+                  <button className="secondary-button" onClick={() => void exportResults()} disabled={loadingData || exporting || sortedItems.length === 0}>
+                    {exporting ? <Spinner /> : <ExportIcon />} {t('exportCsv')}
+                  </button>
                   <button className="secondary-button" onClick={() => void runExplore(currentCursor)} disabled={loadingData || !schema}>
                     <RefreshIcon spinning={loadingData} /> {t('refresh')}
                   </button>
@@ -570,7 +645,7 @@ export default function App(): React.JSX.Element {
               )}
 
               {error && <div className="alert error"><WarningIcon /><span>{localizeError(error, locale)}</span><button onClick={() => setError('')}>×</button></div>}
-              {notice && <div className="alert success"><CheckIcon /><span>{t(notice)}</span><button onClick={() => setNotice('')}>×</button></div>}
+              {notice && <div className="alert success"><CheckIcon /><span>{t(notice.key, notice.values)}</span><button onClick={() => setNotice(undefined)}>×</button></div>}
 
               <section className="data-card">
                 <div className="result-summary">
@@ -583,6 +658,14 @@ export default function App(): React.JSX.Element {
                       <span>{result.durationMs} ms</span>
                     </>
                   )}
+                  {selectedRowIds.size > 0 && (
+                    <div className="selection-actions">
+                      <strong>{t('selectedRecords', { count: selectedRowIds.size })}</strong>
+                      <button className="danger-button compact-danger-button" onClick={requestBulkDelete}>
+                        <TrashIcon /> {t('deleteSelected')}
+                      </button>
+                    </div>
+                  )}
                 </div>
                 <div className="grid-wrap">
                   {loadingData && !result && <DataSkeleton />}
@@ -591,6 +674,15 @@ export default function App(): React.JSX.Element {
                     <table className="data-grid">
                       <thead>
                         <tr>
+                          <th className="selection-column">
+                            <input
+                              type="checkbox"
+                              checked={allRowsSelected}
+                              ref={(input) => { if (input) input.indeterminate = someRowsSelected && !allRowsSelected }}
+                              onChange={toggleAllRows}
+                              aria-label={t(allRowsSelected ? 'deselectAllRecords' : 'selectAllRecords')}
+                            />
+                          </th>
                           {columns.map((column) => {
                             const activeSort = sortColumn === column
                             return (
@@ -611,12 +703,23 @@ export default function App(): React.JSX.Element {
                         </tr>
                       </thead>
                       <tbody>
-                        {sortedItems.map((item, rowIndex) => (
-                          <tr key={rowIdentity(item, schema, rowIndex)}>
-                            {columns.map((column) => <ValueCell key={column} value={item[column]} t={t} />)}
-                            <td className="action-column"><button className="delete-button" onClick={() => requestDelete(item)} title={t('deleteRecord')}><TrashIcon /></button></td>
-                          </tr>
-                        ))}
+                        {sortedItems.map((item, rowIndex) => {
+                          const rowId = rowIdentity(item, schema, rowIndex)
+                          return (
+                            <tr key={rowId} className={selectedRowIds.has(rowId) ? 'selected' : ''}>
+                              <td className="selection-column">
+                                <input
+                                  type="checkbox"
+                                  checked={selectedRowIds.has(rowId)}
+                                  onChange={() => toggleRowSelection(rowId)}
+                                  aria-label={t('selectRecord', { number: rowIndex + 1 })}
+                                />
+                              </td>
+                              {columns.map((column) => <ValueCell key={column} value={item[column]} t={t} />)}
+                              <td className="action-column"><button className="delete-button" onClick={() => requestDelete(item)} title={t('deleteRecord')}><TrashIcon /></button></td>
+                            </tr>
+                          )
+                        })}
                       </tbody>
                     </table>
                   )}
@@ -634,25 +737,27 @@ export default function App(): React.JSX.Element {
         </main>
       </div>
 
-      {deleteCandidate && (
-        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !deleting && setDeleteCandidate(undefined)}>
+      {deleteCandidates && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !deleting && setDeleteCandidates(undefined)}>
           <section className="modal" role="dialog" aria-modal="true" aria-labelledby="delete-title">
             <div className="danger-icon"><TrashIcon /></div>
-            <h2 id="delete-title">{t('deleteRecord')}</h2>
-            <p>{t('deleteDescription')}</p>
+            <h2 id="delete-title">{t(deleteCandidates.length === 1 ? 'deleteRecord' : 'deleteRecords', { count: deleteCandidates.length })}</h2>
+            <p>{t(deleteCandidates.length === 1 ? 'deleteDescription' : 'bulkDeleteDescription', { count: deleteCandidates.length })}</p>
             {isProduction && <div className="production-warning"><WarningIcon /> {t('productionWarning')}</div>}
             <dl className="delete-context">
               <div><dt>{t('profile')}</dt><dd>{profile}</dd></div>
               <div><dt>{t('region')}</dt><dd>{region}</dd></div>
               <div><dt>{t('table')}</dt><dd>{selectedTable}</dd></div>
             </dl>
-            <div className="key-preview">
-              <span>{t('primaryKey')}</span>
-              <pre>{JSON.stringify(simpleDynamoItem(deleteCandidate.key), null, 2)}</pre>
-            </div>
+            {deleteCandidates.length === 1 && (
+              <div className="key-preview">
+                <span>{t('primaryKey')}</span>
+                <pre>{JSON.stringify(simpleDynamoItem(deleteCandidates[0].key), null, 2)}</pre>
+              </div>
+            )}
             <div className="modal-actions">
-              <button className="secondary-button" disabled={deleting} onClick={() => setDeleteCandidate(undefined)}>{t('cancel')}</button>
-              <button className="danger-button" disabled={deleting} onClick={() => void confirmDelete()}>{deleting ? <Spinner /> : <TrashIcon />} {t('deletePermanently')}</button>
+              <button className="secondary-button" disabled={deleting} onClick={() => setDeleteCandidates(undefined)}>{t('cancel')}</button>
+              <button className="danger-button" disabled={deleting} onClick={() => void confirmDelete()}>{deleting ? <Spinner /> : <TrashIcon />} {t(deleteCandidates.length === 1 ? 'deletePermanently' : 'deleteAll', { count: deleteCandidates.length })}</button>
             </div>
           </section>
         </div>
@@ -793,6 +898,26 @@ function rowIdentity(item: DynamoItem, schema: TableSchema | undefined, fallback
   return keys.length ? keys.map((name) => displayDynamoValue(item[name]).full).join('\0') : String(fallback)
 }
 
+function deleteCandidateForItem(item: DynamoItem, schema: TableSchema | undefined): DeleteCandidate | undefined {
+  const tableIndex = schema?.indexes.find((index) => index.kind === 'TABLE')
+  if (!tableIndex) return undefined
+  const names = [tableIndex.partitionKey.name, tableIndex.sortKey?.name].filter(Boolean) as string[]
+  const key = Object.fromEntries(names.map((name) => [name, item[name]]).filter((entry) => Boolean(entry[1])))
+  return { item, key }
+}
+
+async function deleteWithConcurrency<T, TResult>(
+  items: T[],
+  concurrency: number,
+  operation: (item: T) => Promise<TResult>,
+): Promise<Array<PromiseSettledResult<TResult>>> {
+  const outcomes: Array<PromiseSettledResult<TResult>> = []
+  for (let start = 0; start < items.length; start += concurrency) {
+    outcomes.push(...await Promise.allSettled(items.slice(start, start + concurrency).map(operation)))
+  }
+  return outcomes
+}
+
 function formatInteger(value: number | undefined, locale: Locale): string { return value === undefined ? '—' : new Intl.NumberFormat(locale === 'es' ? 'es-MX' : 'en-US').format(value) }
 function formatBytes(value?: number): string {
   if (value === undefined) return '—'
@@ -824,4 +949,5 @@ function TrashIcon(): React.JSX.Element { return <svg viewBox="0 0 24 24"><path 
 function PlayIcon(): React.JSX.Element { return <svg viewBox="0 0 24 24"><path d="m8 5 11 7-11 7V5Z"/></svg> }
 function WarningIcon(): React.JSX.Element { return <svg viewBox="0 0 24 24"><path d="M12 3 2 21h20L12 3Z"/><path d="M12 9v5m0 3v.01"/></svg> }
 function CheckIcon(): React.JSX.Element { return <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/></svg> }
+function ExportIcon(): React.JSX.Element { return <svg viewBox="0 0 24 24"><path d="M12 3v12m-4-4 4 4 4-4M5 17v3h14v-3"/></svg> }
 function Spinner(): React.JSX.Element { return <span className="spinner" /> }

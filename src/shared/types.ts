@@ -116,11 +116,22 @@ export interface DeleteResult {
   deleted: boolean
 }
 
+export interface ExportCsvRequest {
+  tableName: string
+  contents: string
+}
+
+export interface ExportCsvResult {
+  saved: boolean
+  filePath?: string
+}
+
 export interface DynamoExplorerApi {
   listProfiles: () => Promise<AwsProfile[]>
   listTables: (connection: ConnectionContext) => Promise<TableListResult>
   describeTable: (request: ConnectionContext & { tableName: string }) => Promise<TableSchema>
   explore: (request: ExploreRequest) => Promise<ExploreResult>
   deleteItem: (request: DeleteRequest) => Promise<DeleteResult>
+  exportCsv: (request: ExportCsvRequest) => Promise<ExportCsvResult>
 }
 
